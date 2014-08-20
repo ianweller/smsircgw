@@ -309,7 +309,7 @@ if __name__ == '__main__':
     parser = configparser.SafeConfigParser()
     with open(sys.argv[1]) as f:
         parser.readfp(f)
-    config = parser.items('smsircgw')
+    config = dict(parser.items('smsircgw'))
     config['irc_port'] = int(config['irc_port'])
     config['http_server_port'] = int(config['http_server_port'])
 
