@@ -1,5 +1,7 @@
 phonenumbers
 pyOpenSSL
+requests
 service_identity
+tinys3
 twilio
 twisted

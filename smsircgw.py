@@ -1,11 +1,18 @@
 import codecs
 import ConfigParser as configparser
 import json
+import mimetypes
 import phonenumbers
 import random
+import requests
 import sys
+import tempfile
+import time
+import tinys3
 from twilio.rest import TwilioRestClient
+from twilio.rest.exceptions import TwilioRestException
 import twilio.twiml
+from twilio.util import RequestValidator
 from twisted.web import server, resource
 from twisted.words.protocols import irc
 from twisted.internet import protocol, reactor, ssl
@@ -126,9 +133,9 @@ class UserDatabase(object):
 
 class GatewayBot(irc.IRCClient):
 
-    def __init__(self, config):
-        self.nickname = config['irc_nick']
-        super(GatewayBot, self).__init__()
+    @property
+    def nickname(self):
+        return self.factory.config['irc_nick']
 
     # twisted overrides below
 
@@ -219,11 +226,58 @@ class GatewayBot(irc.IRCClient):
 
     # my methods
 
-    def sms_recv(self, number, body):
+    def sms_recv(self, number, body, medias):
         username = self.factory.database.get_username(number)
         if username:
-            self.msg(self.factory.channel,
-                     '<{0}> {1}'.format(username, body))
+            twilioc = self.factory.twilio
+            msg = ['<{0}> {1}'.format(username, body).strip()]
+            for media in medias:
+                ext = mimetypes.guess_extension(media['mime'])
+                if ext is None:
+                    ext = ''
+                if ext == '.jpe':  # wtf python
+                    ext = '.jpg'
+                filename = '{0}{1}{2}'.format(
+                    self.factory.config['s3_bucket_prefix'],
+                    int(time.time() * 1e6), ext)
+                s3 = tinys3.Connection(
+                    self.factory.config['s3_access_key'],
+                    self.factory.config['s3_secret_key'],
+                    endpoint=self.factory.config['s3_endpoint'], tls=True)
+                try:
+                    req = requests.get(media['url'], stream=True)
+                except requests.exceptions.HTTPError:
+                    msg.append('\x034[media download failed]\x03')
+                    continue
+                f = tempfile.TemporaryFile()
+                for chunk in req.iter_content(chunk_size=1024):
+                    if chunk:
+                        f.write(chunk)
+                f.flush()
+                f.seek(0)
+                try:
+                    s3.upload(filename, f, self.factory.config['s3_bucket'])
+                except requests.exceptions.HTTPError:
+                    msg.append('\x034[media upload failed]\x03')
+                    continue
+                msg.append('\x0311http://{0}/{1}\x03'.format(
+                    self.factory.config['s3_bucket'], filename))
+            self.msg(self.factory.channel, ' '.join(msg))
+            # delete the media from twilio
+            for media in medias:
+                while True:
+                    try:
+                        message_sid, unused, media_sid = \
+                            media['url'].split('/')[-3:]
+                        twilioc.media(message_sid).delete(media_sid)
+                    except TwilioRestException as exc:
+                        if exc.status == 400:
+                            time.sleep(5)
+                            continue
+                        else:
+                            if exc.code != 20404:
+                                print(exc.msg)
+                            break
 
 
 class GatewayBotFactory(protocol.ClientFactory):
@@ -262,26 +316,31 @@ class SMSHandlerPage(resource.Resource):
     isLeaf = True
     bot = None
 
+    def __init__(self, config):
+        resource.Resource.__init__(self)
+        self.config = config
+
     def render_GET(self, request):
-        if 'From' not in request.args or 'Body' not in request.args:
-            request.setResponseCode(400)
-            return ''
-        request.setHeader('content-type', 'text/xml')
-        return self.handle_onsms(request.args)
+        return self.render_POST(request)
 
     def render_POST(self, request):
-        if 'From' not in request.args or 'Body' not in request.args:
+        if 'From' not in request.args or 'Body' not in request.args or \
+                not request.requestHeaders.hasHeader('X-Twilio-Signature'):
             request.setResponseCode(400)
             return ''
         request.setHeader('content-type', 'text/xml')
-        return self.handle_onsms(request.args)
-
-    def handle_onsms(self, args):
         resp = twilio.twiml.Response()
+        args = dict((k, v[0]) for k, v in request.args.items())
+        validator = RequestValidator(self.config['twilio_auth_token'])
+        sig = request.requestHeaders.getRawHeaders('X-Twilio-Signature')[0]
+        if not validator.validate(self.config['twilio_callback_url'], args,
+                                  sig):
+            print("Invalid Twilio signature")
+            return str(resp)
         if self.bot:
-            username = self.bot.factory.database.get_username(args['From'][0])
+            username = self.bot.factory.database.get_username(args['From'])
             if username:
-                command = args['Body'][0].strip().lower()
+                command = args['Body'].strip().lower()
                 if command in ('!quiet', 'stop'):
                     self.bot.factory.database.set_quiet(username, True)
                     resp.sms('I won\'t send any messages to you. Send !HI '
@@ -296,7 +355,17 @@ class SMSHandlerPage(resource.Resource):
                 elif command in ('!help', 'help'):
                     resp.sms(SMS_HELP_TEXT)
                 else:
-                    self.bot.sms_recv(args['From'][0], args['Body'][0])
+                    request.write(str(resp))
+                    request.finish()
+                    media = []
+                    for i in xrange(int(args['NumMedia'])):
+                        istr = str(i)
+                        media.append({
+                            'url': args['MediaUrl'+istr],
+                            'mime': args['MediaContentType'+istr],
+                        })
+                    self.bot.sms_recv(args['From'], args['Body'], media)
+                    return 1
         return str(resp)
 
 
@@ -316,7 +385,7 @@ if __name__ == '__main__':
     # HTTP
     root = resource.Resource()
     root.putChild('', IndexPage())
-    smshandler = SMSHandlerPage()
+    smshandler = SMSHandlerPage(config)
     root.putChild('onsms', smshandler)
     reactor.listenTCP(config['http_server_port'], server.Site(root))
 
